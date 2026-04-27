@@ -1,0 +1,618 @@
+建议：**可以开，但不要一上来就大规模跑。先做一个小而严格的 AdaBN / DANN 消融试验。**
+
+原因很简单：二次审计已经确认，当前所谓 `EEGNET+AdaBN+DANN` 目录里的实验其实没有启用 AdaBN，DANN 也没进入训练管线；所以这条线还没有被真正验证过。当前最优仍是 `exp3_vote_5fold`，BA = 0.6329±0.0191，Macro-F1 = 0.6285±0.0232，可以作为对照基线。
+
+我建议顺序是：
+
+1. **先开 AdaBN**：实现成本低，风险可控。
+2. **再做 DANN smoke test**：因为报告说 DANN 不在训练管线里，可能需要补代码，不要直接全量跑。
+3. **所有结果分成 inductive / transductive 两张表**：防止 test/public 无标签数据参与 adaptation 后还和普通 CV 混排。
+
+下面这个任务可以直接发给 AI/Codex。
+
+````markdown
+# EEG 实验任务：真正启用 AdaBN / DANN 并做严格消融验证
+
+## 任务目标
+
+当前二次审计确认：
+
+1. `EEGNET+AdaBN+DANN` 工程目录中，所有配置里的 `adaptation.enabled: false`；
+2. 当前实验实际没有启用 AdaBN；
+3. DANN 代码没有进入训练管线；
+4. 当前最强可信模型是 `exp3_vote_5fold`：
+   - BA = 0.6329±0.0191
+   - Macro-F1 = 0.6285±0.0232
+   - ROC-AUC = 0.6883±0.0211
+
+本任务目标是：在不污染原有可信排行榜的前提下，真正启用 AdaBN 和 DANN，做一组严格、可复现、可审计的消融实验，判断它们是否能超过当前最优 `exp3_vote_5fold`。
+
+---
+
+## 一、总原则
+
+1. 不要覆盖已有实验结果。
+2. 不要删除任何文件。
+3. 不要修改已有 trusted leaderboard。
+4. 所有新实验输出放入新目录：
+
+```text
+EEGNET+AdaBN+DANN/outputs_adaptation_ablation/
+````
+
+5. 所有实验必须记录完整 metadata。
+
+6. 每个实验必须保存：
+
+   * config snapshot
+   * run command
+   * random seed
+   * fold split hash
+   * train/val subject list
+   * metrics json
+   * prediction csv
+   * leakage audit note
+
+7. public test 数据不得参与训练、调参、early stopping、模型选择。
+
+8. 如果使用 val/test/public 无标签数据更新 BN 或参与 domain adaptation，必须标注为 `transductive`，不能和普通 inductive 实验直接混排。
+
+9. 最终输出必须分成：
+
+   * inductive leaderboard
+   * transductive leaderboard
+   * comparison against exp3_vote_5fold
+
+---
+
+## 二、实验基线
+
+以当前可信最优模型作为主对照：
+
+```text
+baseline = exp3_vote_5fold
+BA = 0.6329±0.0191
+Macro-F1 = 0.6285±0.0232
+ROC-AUC = 0.6883±0.0211
+```
+
+同时保留以下对照：
+
+```text
+exp1_baseline_5fold
+exp2_freq_5fold
+dep_focal_cohort_classbal_cv_full
+clean_cv_full
+```
+
+---
+
+## 三、第一阶段：AdaBN 小规模验证
+
+### 3.1 目标
+
+验证 AdaBN 是否真的有收益，同时避免评估泄露。
+
+### 3.2 需要先检查代码
+
+请检查以下文件：
+
+```text
+EEGNET+AdaBN+DANN/training/trainer.py
+EEGNET+AdaBN+DANN/configs/base_eegnet.yaml
+EEGNET+AdaBN+DANN/data/dataset.py
+EEGNET+AdaBN+DANN/models/*.py
+```
+
+确认：
+
+1. AdaBN 的触发条件是什么；
+2. 是否通过以下配置控制：
+
+```yaml
+adaptation:
+  enabled: true
+  apply_on_val: true
+  allow_target_statistics: true
+```
+
+3. BN 统计更新是否只影响 running_mean / running_var；
+4. 是否会反向传播更新模型参数；
+5. 是否会错误使用 label；
+6. 是否会把 validation label 用进 adaptation。
+
+---
+
+### 3.3 AdaBN 实验设计
+
+请创建以下实验配置，不要覆盖原配置。
+
+#### 实验 A：AdaBN-off 对照
+
+```text
+adabn_off_exp3_vote_5fold
+```
+
+要求：
+
+* 复制当前 `exp3_vote_5fold` 设置；
+* 明确设置：
+
+```yaml
+adaptation:
+  enabled: false
+```
+
+* 用同一套 fold split；
+* 作为 sanity check，结果应接近原 `exp3_vote_5fold`。
+
+---
+
+#### 实验 B：AdaBN train-only
+
+```text
+adabn_train_only_exp3_vote_5fold
+```
+
+要求：
+
+* 只允许使用 training fold 数据更新 BN；
+* 不允许使用 validation / test / public 数据；
+* 属于 inductive setting；
+* 可以进入 inductive leaderboard。
+
+配置原则：
+
+```yaml
+adaptation:
+  enabled: true
+  apply_on_train: true
+  apply_on_val: false
+  allow_target_statistics: false
+```
+
+如果现有代码不支持 `apply_on_train`，请实现或用等价逻辑。
+
+---
+
+#### 实验 C：AdaBN validation-transductive
+
+```text
+adabn_val_transductive_exp3_vote_5fold
+```
+
+要求：
+
+* 使用 validation fold 的无标签数据更新 BN；
+* 然后在同一 validation fold 上评估；
+* 明确标记为 transductive；
+* 不能进入普通 trusted inductive leaderboard；
+* 只能进入 transductive leaderboard。
+
+配置原则：
+
+```yaml
+adaptation:
+  enabled: true
+  apply_on_val: true
+  allow_target_statistics: true
+  use_labels: false
+```
+
+安全要求：
+
+* 不得使用 validation labels；
+* 不得反向传播；
+* 不得更新除 BN running stats 以外的参数；
+* 必须在报告中明确说明这是 transductive evaluation。
+
+---
+
+#### 实验 D：AdaBN public-transductive inference
+
+```text
+adabn_public_transductive_inference
+```
+
+要求：
+
+* 仅做 public 无标签推理；
+* 可以用 public 无标签数据更新 BN；
+* 不计算 BA / Macro-F1 / ROC-AUC；
+* 不参与模型选择；
+* 只输出 prediction csv；
+* 标记为 public transductive inference。
+
+---
+
+## 四、第二阶段：DANN smoke test
+
+### 4.1 目标
+
+确认 DANN 是否已经可用；如果不可用，先不要全量训练，先补最小可运行实现。
+
+### 4.2 先检查 DANN 是否存在
+
+递归搜索：
+
+```text
+DANN
+domain adversarial
+GradientReverse
+GRL
+gradient reversal
+domain_classifier
+domain_loss
+source_loader
+target_loader
+```
+
+如果不存在，请生成报告：
+
+```text
+DANN not implemented in training pipeline
+```
+
+然后进入最小实现阶段。
+
+---
+
+### 4.3 DANN 最小实现要求
+
+如果需要补代码，请实现最小 DANN 版本：
+
+模型结构：
+
+```text
+feature_extractor -> emotion_classifier
+                  -> gradient_reversal -> domain_classifier
+```
+
+loss：
+
+```text
+total_loss = emotion_loss + lambda_domain * domain_loss
+```
+
+要求：
+
+1. emotion loss 只用 source/train labels；
+2. domain loss 可以用 source/train 和 target/unlabeled；
+3. validation labels 不能用于 DANN 训练；
+4. public labels 不存在，不能用于任何指标；
+5. target_loader 来源必须明确记录；
+6. 所有 DANN 实验必须标注 inductive / transductive。
+
+---
+
+### 4.4 DANN 实验设计
+
+#### 实验 E：DANN train-domain-only
+
+```text
+dann_train_domain_only_5fold
+```
+
+要求：
+
+* source = training fold 中的一部分 subject/domain；
+* target = training fold 中另一部分 subject/domain；
+* validation fold 不参与 DANN；
+* 属于 inductive；
+* 可以进入 inductive leaderboard。
+
+如果数据没有明确 domain 字段，可按 subject 分组构造 domain，但必须记录策略。
+
+---
+
+#### 实验 F：DANN val-transductive
+
+```text
+dann_val_transductive_5fold
+```
+
+要求：
+
+* source = train fold；
+* target = validation fold 无标签数据；
+* validation labels 不参与训练；
+* 训练后在 validation fold 上评估；
+* 标记为 transductive；
+* 不进入普通 inductive leaderboard。
+
+---
+
+#### 实验 G：DANN public-transductive inference
+
+```text
+dann_public_transductive_inference
+```
+
+要求：
+
+* source = full train / CV selected train；
+* target = public unlabeled；
+* 不计算 public metrics；
+* 不参与模型选择；
+* 只输出 prediction csv；
+* 标记为 public transductive inference。
+
+---
+
+## 五、严格防泄露要求
+
+### 5.1 禁止行为
+
+以下行为一律视为 high 或 critical 泄露：
+
+1. 使用 validation labels 参与 AdaBN / DANN；
+2. 使用 test/public 结果选择模型；
+3. public prediction 结果反过来影响训练；
+4. 用 validation/test/public 数据做 early stopping；
+5. 在全数据上 fit scaler 后再划分；
+6. 先增强 / 过采样 / GAN 生成后再划分；
+7. 同一 subject 同时进入 train 和 validation；
+8. 同一 trial/window 同时进入 train 和 validation；
+9. transductive 结果混入 inductive leaderboard。
+
+---
+
+### 5.2 每个实验必须审计
+
+每个新实验完成后，自动生成：
+
+```text
+leakage_check.json
+```
+
+内容至少包括：
+
+```json
+{
+  "experiment": "",
+  "setting": "inductive/transductive/public_inference",
+  "uses_val_unlabeled_for_adaptation": false,
+  "uses_val_labels_for_training": false,
+  "uses_public_for_training": false,
+  "uses_public_for_model_selection": false,
+  "updates_bn_on_target": false,
+  "updates_model_weights_on_target": false,
+  "subject_overlap": false,
+  "trial_overlap": false,
+  "window_overlap": false,
+  "normalization_fit_scope": "train_only",
+  "risk_level": "low/medium/high/critical",
+  "notes": ""
+}
+```
+
+---
+
+## 六、运行顺序
+
+请按以下顺序执行，不要一上来全量乱跑：
+
+### Step 1：代码与配置检查
+
+输出：
+
+```text
+outputs_adaptation_ablation/precheck_adabn_dann.md
+```
+
+内容：
+
+1. AdaBN 当前触发条件；
+2. DANN 是否已实现；
+3. 需要修改哪些文件；
+4. 是否存在泄露风险；
+5. 推荐实验路径。
+
+---
+
+### Step 2：AdaBN-off sanity check
+
+先跑：
+
+```text
+adabn_off_exp3_vote_5fold
+```
+
+要求结果接近原 `exp3_vote_5fold`。
+
+如果差异过大，停止，先排查。
+
+---
+
+### Step 3：AdaBN train-only
+
+跑：
+
+```text
+adabn_train_only_exp3_vote_5fold
+```
+
+这是最安全的 AdaBN 版本。
+
+---
+
+### Step 4：AdaBN val-transductive
+
+跑：
+
+```text
+adabn_val_transductive_exp3_vote_5fold
+```
+
+必须单独放入 transductive leaderboard。
+
+---
+
+### Step 5：DANN smoke test
+
+只跑一个 fold：
+
+```text
+dann_train_domain_only_fold0_smoke
+```
+
+如果 fold0 正常，再考虑 5-fold。
+
+---
+
+### Step 6：DANN 5-fold
+
+只有 smoke test 正常时才跑：
+
+```text
+dann_train_domain_only_5fold
+dann_val_transductive_5fold
+```
+
+---
+
+## 七、指标与输出
+
+每个实验输出：
+
+```text
+summary_metrics.json
+fold_metrics.csv
+predictions.csv
+classification_report.csv
+confusion_matrix.png
+roc_curve.png
+pr_curve.png
+run_metadata.json
+leakage_check.json
+```
+
+最终生成：
+
+```text
+outputs_adaptation_ablation/adaptation_ablation_report.md
+outputs_adaptation_ablation/inductive_leaderboard.csv
+outputs_adaptation_ablation/transductive_leaderboard.csv
+outputs_adaptation_ablation/public_inference_runs.csv
+outputs_adaptation_ablation/comparison_against_exp3_vote_5fold.csv
+outputs_adaptation_ablation/leakage_summary.csv
+```
+
+---
+
+## 八、最终报告必须回答的问题
+
+请在 `adaptation_ablation_report.md` 中明确回答：
+
+1. AdaBN 是否真的启用了？
+2. DANN 是否真的进入训练管线？
+3. AdaBN train-only 是否超过 `exp3_vote_5fold`？
+4. AdaBN val-transductive 是否超过 `exp3_vote_5fold`？
+5. DANN train-domain-only 是否超过 `exp3_vote_5fold`？
+6. DANN val-transductive 是否超过 `exp3_vote_5fold`？
+7. 哪些结果是 inductive？
+8. 哪些结果是 transductive？
+9. 是否存在 validation/test/public 泄露？
+10. 是否建议把 AdaBN/DANN 纳入最终模型？
+
+---
+
+## 九、结果判定标准
+
+### 可以接受为主线的情况
+
+满足以下条件才可进入最终主线：
+
+1. 5-fold CV；
+2. inductive setting；
+3. 不使用 validation/test/public 做 adaptation；
+4. 无 subject/trial/window 泄露；
+5. BA 或 Macro-F1 稳定超过 `exp3_vote_5fold`；
+6. std 不明显变大；
+7. 至少通过一次重复 seed 验证。
+
+---
+
+### 只能作为补充分析的情况
+
+以下结果只能作为补充，不进入主排行榜：
+
+1. val-transductive AdaBN；
+2. val-transductive DANN；
+3. public-transductive inference；
+4. 只在 single-fold 上提升；
+5. 提升小于 0.005 且 std 变大；
+6. 需要使用目标域无标签数据才提升。
+
+---
+
+### 不建议继续的情况
+
+如果出现以下情况，停止对应方向：
+
+1. BA 下降超过 0.01；
+2. Macro-F1 下降超过 0.01；
+3. std 明显增大；
+4. 出现 high/critical 泄露；
+5. DANN 训练不稳定；
+6. domain loss 主导训练；
+7. 多数 fold 提升不一致。
+
+---
+
+## 十、最终终端摘要格式
+
+最后打印：
+
+```text
+===== AdaBN/DANN Ablation Summary =====
+
+Baseline:
+  exp3_vote_5fold
+  BA:
+  Macro-F1:
+  ROC-AUC:
+
+AdaBN precheck:
+  implemented:
+  enabled:
+  leakage risk:
+
+DANN precheck:
+  implemented:
+  enters training pipeline:
+  leakage risk:
+
+Inductive experiments:
+  best:
+  BA:
+  Macro-F1:
+  beats baseline:
+  delta BA:
+  delta Macro-F1:
+
+Transductive experiments:
+  best:
+  BA:
+  Macro-F1:
+  beats baseline:
+  delta BA:
+  delta Macro-F1:
+
+Public inference:
+  generated:
+  metrics computed: no
+
+Leakage check:
+  high risk:
+  critical risk:
+
+Recommendation:
+======================================
+```
+
+```
+
+我的建议是：**先跑 AdaBN，不要急着全量 DANN。**  
+AdaBN 可能很快验证出有没有用；DANN 更容易因为 domain 定义、target_loader 和训练不稳定把事情搞复杂。
+```
