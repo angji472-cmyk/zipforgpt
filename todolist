@@ -1,0 +1,1445 @@
+````markdown
+# EEG 情绪分类实验审计任务：结果一致性 + 数据泄露 / 结果虚高风险检查
+
+请对当前工作区中的 EEG 情绪分类实验结果做一次完整审计。
+
+本任务的核心目标不是重新训练模型，而是确认：
+
+1. 当前排行榜是否可信；
+2. 是否有实验被遗漏或错误纳入排行榜；
+3. 是否存在数据泄露、评估泄露、调参偏差等导致结果虚高的问题；
+4. 哪些实验可以进入最终可信排行榜；
+5. 哪些实验需要排除或人工复核。
+
+---
+
+## 0. 总体要求
+
+### 0.1 执行原则
+
+1. 不要删除任何文件。
+2. 不要覆盖已有实验结果。
+3. 不要重新训练模型。
+4. 不要重新生成预测。
+5. 不要修改原始实验目录。
+6. 只做扫描、审计、统计和报告生成。
+7. 所有新生成文件统一放到：
+
+```text
+audit_outputs/
+````
+
+8. 所有报告中的路径使用相对路径。
+9. 如果证据不足，不要强行判定安全，标记为 `unknown`。
+10. 如果发现高风险泄露，不要自动修复，只在报告中说明。
+11. 每个高风险结论必须给出具体证据路径。
+12. public test 推理目录不能进入最终排行榜。
+13. single-fold 结果不能作为最终可信模型选择依据。
+14. 最终排行榜必须优先使用 5-fold CV 的 mean ± std。
+15. 审计脚本应尽量稳健：缺文件、空 JSON、字段缺失时不要崩溃，而是记录为 incomplete / unknown。
+
+---
+
+## 1. 检查范围
+
+递归扫描以下目录：
+
+```text
+EEGNET/outputs
+EEGNET+AdaBN+DANN/outputs
+```
+
+排除：
+
+```text
+_backup
+backup
+tmp
+temp
+__pycache__
+.ipynb_checkpoints
+```
+
+如果发现其他可能相关的 outputs / runs / results 目录，也可以纳入扫描，但需要在报告中说明。
+
+---
+
+## 2. 已知背景与重点核查对象
+
+当前重评估日志显示：
+
+* 总共约 80 个实验目录重新评估成功；
+* 原先 public 测试集目录因为 `y_true = -1` 导致 metrics 计算失败；
+* 修复后 public 目录应只保存预测，不应计算 BA / Macro-F1 / ROC-AUC；
+* 当前原始结果中，EEGNET 项目里 `exp3_vote_5fold` 看起来排名较高；
+* 当前原始结果中，AdaBN+DANN 项目里 `dep_focal_cohort_classbal_cv_full` 看起来排名较高；
+* 旧记录里曾有 `tune_b_plateau_wide`，其 Macro-F1 约为 `0.6297±0.0080`；
+* 当前新汇总里 `exp3_vote_5fold` 的 Macro-F1 约为 `0.6285±0.0232`；
+* 需要检查 `tune_b_plateau_wide` 是否被遗漏、指标口径是否一致、是否存在评估泄露或调参偏差。
+
+重点核查以下实验：
+
+1. `exp3_vote_5fold`
+
+   * 当前 EEGNET 排名靠前；
+   * 检查投票融合是否使用验证集 / 测试集调权重；
+   * 检查两个分支是否使用相同 fold；
+   * 检查是否存在 subject / trial / window 级泄露。
+
+2. `tune_b_plateau_wide`
+
+   * 旧记录中 Macro-F1 约为 `0.6297±0.0080`；
+   * 检查目录是否存在；
+   * 检查是否被这次扫描遗漏；
+   * 检查是否和当前排行榜指标口径一致；
+   * 检查是否属于 5-fold CV；
+   * 检查是否存在调参偏差。
+
+3. `dep_focal_cohort_classbal_cv_full`
+
+   * 当前 AdaBN+DANN 排名靠前；
+   * 检查 focal loss class weights 是否只从训练集统计；
+   * 检查 cohort / class balance 是否在 fold 内完成；
+   * 检查是否存在 DANN / AdaBN 相关评估泄露。
+
+4. `robotfaces4s_ft_cv_full`
+
+   * 检查预训练数据是否和当前任务数据有重叠；
+   * 检查 fine-tuning 是否只使用训练 fold；
+   * 检查是否把验证集 / 测试集用于模型选择。
+
+5. 所有 AdaBN 相关实验
+
+   * 检查 BN 统计是否使用 val / test / public 数据；
+   * 检查是否属于 transductive setting；
+   * 检查是否和普通 supervised CV 混在同一排行榜比较。
+
+6. 所有 DANN 相关实验
+
+   * 检查 target_loader 是否包含 validation / test / public；
+   * 检查是否使用目标域无标签数据后又在同一目标域评估；
+   * 检查是否将 transductive 结果与 inductive 结果混排。
+
+---
+
+## 3. 实验结果一致性审计
+
+### 3.1 每个实验目录检查文件
+
+对每个实验目录检查是否存在：
+
+```text
+summary_metrics.json
+run_metadata.json
+prediction.csv
+predictions.csv
+fold_metrics.csv
+classification_report.csv
+confusion_matrix.csv
+confusion_matrix.png
+roc_curve.png
+pr_curve.png
+train.log
+eval.log
+```
+
+以上文件名不一定完全一致，请做宽松匹配，例如：
+
+```text
+*metric*
+*summary*
+*metadata*
+*pred*
+*confusion*
+*report*
+*roc*
+*pr*
+*log*
+```
+
+---
+
+### 3.2 实验分类
+
+将每个实验目录分类为以下之一：
+
+| 类别                        | 含义                                 |
+| ------------------------- | ---------------------------------- |
+| `5-fold CV`               | 有明确 5 折交叉验证结果，包含 mean ± std        |
+| `single-fold`             | 只有单折或单次划分结果                        |
+| `public inference`        | public/test 无标签推理，通常 `y_true = -1` |
+| `invalid/incomplete`      | 缺少关键文件，无法计算或无法判断                   |
+| `suspicious/needs_review` | 可算指标但存在明显疑点或证据不足                   |
+
+判断依据包括：
+
+* 是否存在 fold 字段；
+* 是否有 5 个 fold；
+* std 是否大于 0；
+* 是否含 public / test / infer / submit 等关键词；
+* prediction CSV 中 `y_true` 是否全为 `-1`；
+* summary metrics 是否包含 mean / std；
+* run_metadata 是否说明 split 类型。
+
+---
+
+### 3.3 指标抽取
+
+从 `summary_metrics.json` 或相关指标文件中抽取：
+
+```text
+balanced_accuracy mean
+balanced_accuracy std
+macro_f1 mean
+macro_f1 std
+roc_auc mean
+roc_auc std
+fold 数量
+样本数量
+类别数量
+```
+
+重点指标口径：
+
+```text
+trial10s / all:all
+```
+
+如果存在多个口径，例如：
+
+```text
+window
+trial10s
+trial50s
+subject
+all:all
+```
+
+请分别记录，但最终主排行榜优先使用：
+
+```text
+trial10s / all:all
+```
+
+如果某实验没有该口径，则标为 `metric_scope_mismatch`，不要直接和主排行榜混排。
+
+---
+
+### 3.4 public 目录处理规则
+
+public inference 目录通常没有真实标签，可能表现为：
+
+```text
+y_true = -1
+```
+
+这些目录：
+
+1. 不能计算 BA；
+2. 不能计算 Macro-F1；
+3. 不能计算 ROC-AUC；
+4. 不能进入 raw leaderboard；
+5. 不能进入 trusted leaderboard；
+6. 只能记录为 public inference；
+7. 可以保存预测文件路径和样本数。
+
+如果发现 `y_true=-1` 参与了指标计算，标为：
+
+```text
+critical metric error
+```
+
+---
+
+### 3.5 tune_b_plateau_wide 专项检查
+
+专门查找：
+
+```text
+tune_b_plateau_wide
+```
+
+需要回答：
+
+1. 目录是否存在；
+2. 是否存在 `summary_metrics.json`；
+3. 是否存在 `run_metadata.json`；
+4. 是否存在 prediction CSV；
+5. 是否是 5-fold；
+6. 是否使用 trial10s / all:all；
+7. 旧记录 `macro_f1 = 0.6297±0.0080` 是否能从文件中复现；
+8. 如果不能复现，原因是什么：
+
+   * 目录缺失；
+   * 文件被覆盖；
+   * 指标口径变化；
+   * 扫描脚本遗漏；
+   * 只是一条旧日志；
+   * 不是 5-fold；
+   * 属于 single-fold；
+   * 被判为泄露风险；
+   * 其他原因。
+
+---
+
+## 4. 数据泄露 / 结果虚高风险审计
+
+本部分重点不是隐私安全，而是机器学习评估是否公平。
+
+需要检查是否存在以下会导致结果虚高的问题：
+
+* subject-level 泄露；
+* trial-level 泄露；
+* window-level 泄露；
+* 归一化 / 标准化泄露；
+* 特征提取泄露；
+* 过采样 / 增强 / GAN 泄露；
+* AdaBN 使用 val/test/public 更新 BN；
+* DANN 使用 val/test/public 作为 target；
+* 超参数调优偏差；
+* early stopping 使用 test 指标；
+* ensemble / voting 用验证集或测试集调权重；
+* 重复样本 / 近重复样本跨 split；
+* public test 参与模型选择；
+* label 泄露；
+* fold 生成不一致；
+* 指标计算错误。
+
+---
+
+## 5. Subject-level 泄露检查
+
+### 5.1 目标
+
+确认数据划分是否以 subject 为单位，避免同一个 subject 同时出现在 train 和 val/test 中。
+
+### 5.2 检查内容
+
+查找 split 文件、metadata、prediction CSV、日志、脚本中的字段：
+
+```text
+subject
+subject_id
+sub_id
+participant
+participant_id
+person
+person_id
+user_id
+patient_id
+S01
+sub001
+```
+
+检查每个 fold：
+
+1. train subjects；
+2. validation subjects；
+3. test subjects；
+4. subject overlap；
+5. 每个 subject 的样本数；
+6. 每个 subject 的标签分布。
+
+### 5.3 高风险情况
+
+以下情况标为 `high`：
+
+```text
+同一个 subject 同时出现在 train 和 validation/test
+```
+
+如果 subject ID 不可获得，标为：
+
+```text
+unknown
+```
+
+并说明原因。
+
+### 5.4 输出字段
+
+生成 `split_integrity_report.csv`，至少包含：
+
+```csv
+experiment,project,fold,n_train,n_val,n_test,subject_overlap_count,overlap_subjects,risk_level,reason,evidence_path
+```
+
+---
+
+## 6. Window-level 泄露检查
+
+### 6.1 目标
+
+EEG 数据常被切成多个窗口。必须确认同一个 trial / segment 的不同 window 没有跨 train / val / test。
+
+### 6.2 检查字段
+
+查找：
+
+```text
+window_id
+segment_id
+trial_id
+epoch_id
+clip_id
+sample_id
+source_id
+original_id
+file_id
+start_time
+end_time
+```
+
+### 6.3 高风险情况
+
+以下情况标为 `high`：
+
+```text
+同一个 subject + trial 的不同 window 同时出现在 train 和 validation/test
+```
+
+尤其注意：
+
+* 先切 window 再随机 KFold；
+* 同一 trial 的 window 被随机打散；
+* 同一原始 EEG 片段的增强版本跨集合；
+* trial10s 和 trial50s 来自同一原始 trial 但被当作独立样本。
+
+### 6.4 输出字段
+
+```csv
+experiment,project,fold,trial_overlap_count,window_overlap_count,example_ids,risk_level,reason,evidence_path
+```
+
+---
+
+## 7. Trial-level 泄露检查
+
+### 7.1 目标
+
+确认同一个 trial 或同源 trial 派生样本没有跨 train / val / test。
+
+### 7.2 检查内容
+
+检查：
+
+1. `trial_id` 是否跨 split 重复；
+2. `trial10s` / `trial50s` 是否来自同一原始 trial；
+3. 不同长度切片是否存在重叠；
+4. 同一段 EEG 是否重复采样后进入不同集合；
+5. 文件 basename 是否重复出现在不同 split；
+6. sample_id 是否能回溯到原始 trial。
+
+### 7.3 高风险情况
+
+```text
+同一 trial 的派生样本进入不同集合
+```
+
+标为 `high`。
+
+---
+
+## 8. 归一化 / 标准化泄露检查
+
+### 8.1 目标
+
+确认 scaler、normalizer、z-score、baseline correction 等只在训练集上拟合，不能用全数据或验证集 / 测试集统计量。
+
+### 8.2 搜索关键词
+
+递归搜索代码、日志、notebook、metadata：
+
+```text
+StandardScaler
+MinMaxScaler
+RobustScaler
+Normalizer
+zscore
+z-score
+mean
+std
+normalize
+normalization
+standardize
+standardization
+baseline correction
+per-channel
+per-subject
+fit_transform
+fit(
+transform(
+```
+
+### 8.3 高风险写法
+
+```python
+scaler.fit(all_data)
+X = scaler.transform(all_data)
+train, val = split(X)
+```
+
+或：
+
+```python
+X = scaler.fit_transform(X)
+train, val = split(X)
+```
+
+或：
+
+```python
+mean = X.mean()
+std = X.std()
+X = (X - mean) / std
+train, val = split(X)
+```
+
+### 8.4 正确写法
+
+```python
+scaler.fit(X_train)
+X_train = scaler.transform(X_train)
+X_val = scaler.transform(X_val)
+```
+
+### 8.5 需要判断
+
+1. 是否在 split 前对全数据归一化；
+2. 是否用所有 subject 统计量；
+3. 是否用 val/test 数据计算 mean/std；
+4. 是否在 cross-validation 外部提前 fit scaler；
+5. 是否对每个 fold 单独 fit；
+6. 是否把 scaler 保存到 fold 内。
+
+### 8.6 输出字段
+
+生成 `normalization_leakage_report.csv`：
+
+```csv
+experiment,project,normalization_method,normalization_scope,risk_level,evidence_path,evidence_snippet,recommendation
+```
+
+---
+
+## 9. 特征提取泄露检查
+
+### 9.1 目标
+
+检查 EEG 特征是否在全数据上提前计算，尤其是涉及标签或统计拟合的特征。
+
+### 9.2 重点特征
+
+检查：
+
+```text
+FFT
+PSD
+bandpower
+band power
+differential entropy
+DE
+covariance
+CSP
+PCA
+ICA
+Riemannian
+feature selection
+SelectKBest
+mutual_info
+ANOVA
+LDA
+filter bank
+```
+
+### 9.3 风险判断
+
+低风险：
+
+```text
+对每个样本独立做 FFT / PSD / bandpower，且不使用全局统计量或标签
+```
+
+中风险：
+
+```text
+全局缓存 feature file，但不确定是否含标签相关选择
+```
+
+高风险：
+
+```text
+PCA / CSP / 特征选择 / 统计筛选 在全数据上 fit 后再 CV
+```
+
+高风险示例：
+
+```python
+features = extract_features(all_data)
+selected_features = select_features(features, labels)
+then do cross validation
+```
+
+正确方式：
+
+```text
+每个 fold 内只用 training set fit PCA / CSP / feature selector，然后 transform validation/test
+```
+
+### 9.4 输出
+
+写入 `normalization_leakage_report.csv` 或单独生成：
+
+```text
+feature_extraction_leakage_report.csv
+```
+
+---
+
+## 10. 类别平衡 / 采样 / 增强 / GAN 泄露检查
+
+### 10.1 目标
+
+确认 class balancing、oversampling、augmentation、GAN 生成样本只发生在训练 fold 内。
+
+### 10.2 搜索关键词
+
+```text
+SMOTE
+RandomOverSampler
+oversample
+undersample
+class balance
+class_balanced
+WeightedRandomSampler
+weighted sampler
+focal
+class weights
+augmentation
+augment
+noise
+jitter
+mixup
+cutmix
+GAN
+generator
+synthetic
+fake
+```
+
+### 10.3 高风险情况
+
+```text
+先对全数据做过采样 / 增强 / GAN 生成，再划分 train/val/test
+```
+
+或：
+
+```text
+GAN 使用全数据训练，生成样本又参与训练/验证划分
+```
+
+或：
+
+```text
+增强样本和原始样本跨 train/val/test
+```
+
+### 10.4 正确方式
+
+```text
+每个 fold 内，只对 training set 做增强、过采样或 GAN 生成
+```
+
+### 10.5 focal loss / class weights 检查
+
+对 `focal`、`classbal` 相关实验，检查 class weights 是否只由训练 fold 的标签分布计算。
+
+高风险：
+
+```text
+使用全数据标签分布计算 class weights
+```
+
+中风险：
+
+```text
+无法确认 class weights 来源
+```
+
+---
+
+## 11. AdaBN 泄露检查
+
+### 11.1 目标
+
+检查 AdaBN 是否在 validation / test / public 数据上更新 BatchNorm 统计量，然后又在同一数据上评估。
+
+这是 EEGNET+AdaBN+DANN 项目的重点风险。
+
+### 11.2 搜索关键词
+
+```text
+AdaBN
+adabn
+BatchNorm
+batchnorm
+BN
+update_bn
+reset_running_stats
+running_mean
+running_var
+track_running_stats
+model.train()
+model.eval()
+target_loader
+val_loader
+test_loader
+public_loader
+infer_loader
+```
+
+### 11.3 可接受情况
+
+以下情况风险较低：
+
+```text
+只在训练域数据上更新 BN
+```
+
+或：
+
+```text
+每个 fold 内只使用 training set 更新 BN 统计量
+```
+
+或：
+
+```text
+使用无标签目标域做 transductive adaptation，但最终报告明确标注为 transductive，不和普通 inductive CV 混排
+```
+
+### 11.4 高风险情况
+
+以下情况标为 `high`：
+
+```python
+for x in val_loader:
+    model.train()
+    model(x)  # update BN stats
+
+model.eval()
+evaluate(val_loader)
+```
+
+或者：
+
+```text
+在 validation/test 数据上更新 BN 后，再在同一批数据上计算指标
+```
+
+或者：
+
+```text
+public test 数据用于 AdaBN 更新后再预测，但没有标注 transductive setting
+```
+
+或者：
+
+```text
+所有 fold 的数据一起用于 BN 统计
+```
+
+### 11.5 输出字段
+
+生成 `adabn_dann_leakage_report.csv`：
+
+```csv
+experiment,project,method,loader_used,adaptation_setting,risk_level,evidence_path,evidence_snippet,recommendation
+```
+
+---
+
+## 12. DANN / 域自适应泄露检查
+
+### 12.1 目标
+
+检查 DANN 是否使用 validation / test / public 作为 target domain 参与训练。
+
+### 12.2 搜索关键词
+
+```text
+DANN
+domain adversarial
+gradient reversal
+GRL
+source_loader
+target_loader
+domain_loader
+target domain
+source domain
+lambda_domain
+domain_loss
+```
+
+### 12.3 需要确认
+
+1. source domain 是什么；
+2. target domain 是什么；
+3. target_loader 是否包含 val/test/public；
+4. 是否使用测试 subject 的无标签数据；
+5. 如果用了测试域无标签数据，是否明确属于 transductive domain adaptation；
+6. 评估时是否把 transductive 和 inductive 结果混在一起比较。
+
+### 12.4 高风险情况
+
+```text
+用 validation / test / public 样本作为 target domain 训练 DANN，然后又在这些样本上评估
+```
+
+这种结果不能和普通 supervised CV 公平比较。
+
+### 12.5 输出标签
+
+给每个相关实验标注：
+
+```text
+inductive
+transductive
+contaminated
+unclear
+```
+
+---
+
+## 13. 超参数调优泄露 / 模型选择偏差检查
+
+### 13.1 目标
+
+检查是否反复用同一 validation / CV split 调参，然后把最优结果当作无偏泛化性能。
+
+### 13.2 重点实验名关键词
+
+```text
+tune
+plateau
+wide
+focal
+classbal
+gated
+vote
+bp_only
+freq
+baseline
+ablation
+search
+grid
+sweep
+```
+
+### 13.3 需要判断
+
+1. 是否存在大量实验都在同一 CV split 上比较；
+2. 是否用同一套 validation fold 选择最优模型；
+3. 是否缺少 nested CV；
+4. 是否把调参集结果当作最终泛化性能；
+5. 是否用 public/test 结果调整模型结构；
+6. 是否把模型选择结果和最终泛化估计混为一谈。
+
+### 13.4 风险等级
+
+| 情况                            | 风险       |
+| ----------------------------- | -------- |
+| 单次预注册实验                       | low      |
+| 多实验调参后仍报同一 CV 最优              | medium   |
+| 没有 nested CV，但未使用 test/public | medium   |
+| 用 public/test 结果调参            | critical |
+| nested CV 或独立 hold-out test   | low      |
+
+### 13.5 报告中必须说明
+
+如果没有 nested CV，最终报告应明确写：
+
+```text
+当前排行榜更适合作为模型选择结果，不应被解释为严格无偏的泛化性能估计。
+```
+
+---
+
+## 14. Early stopping 泄露检查
+
+### 14.1 目标
+
+确认 early stopping 和 checkpoint selection 只基于训练 fold 内的 validation set，不能使用 test/public 指标。
+
+### 14.2 搜索关键词
+
+```text
+early_stopping
+early stopping
+best_val
+best_test
+best_acc
+best_metric
+save_best
+checkpoint
+monitor
+patience
+val_loss
+test_loss
+val_acc
+test_acc
+best_auc
+```
+
+### 14.3 高风险情况
+
+```text
+使用 test loss / test accuracy / public feedback 选择 checkpoint
+```
+
+或：
+
+```text
+保存 best_test 对应模型作为最终模型
+```
+
+如果出现 `best_test` 选模型，标为 `high` 或 `critical`。
+
+---
+
+## 15. Ensemble / Voting 泄露检查
+
+### 15.1 目标
+
+重点检查 `exp3_vote_5fold` 这类投票融合实验。
+
+### 15.2 需要确认
+
+1. 投票权重是否固定；
+2. 投票规则是否提前确定；
+3. 是否用 validation/test 表现调权重；
+4. 是否根据测试集表现选择融合方式；
+5. 两个分支是否在同一 fold 下训练和评估；
+6. 两个分支是否使用相同 train/val split；
+7. 是否存在一个分支训练时看到了另一个分支的验证集信息。
+
+### 15.3 风险判断
+
+低风险：
+
+```text
+简单平均 / 多数投票 / 固定权重，且未用验证集调权重
+```
+
+中风险：
+
+```text
+用 validation set 选择融合方式，但未使用 test/public
+```
+
+高风险：
+
+```text
+用 test/public 表现选择投票权重或融合方式
+```
+
+---
+
+## 16. 重复样本 / 近重复样本检查
+
+### 16.1 目标
+
+检查数据集中是否存在重复或近重复样本跨 split。
+
+### 16.2 检查方法
+
+尽可能使用以下方式：
+
+1. 对原始样本路径做 hash；
+2. 对 prediction CSV 中的 sample_id 去重；
+3. 对特征文件做 hash；
+4. 检查 `subject_id + trial_id + window_id`；
+5. 检查文件名 basename 是否重复；
+6. 检查同一 basename 是否出现在不同 split；
+7. 检查增强样本是否能回溯到原始样本。
+
+### 16.3 输出字段
+
+生成 `duplicate_sample_report.csv`：
+
+```csv
+experiment,project,fold,duplicate_type,count,risk_level,example_ids,evidence_path
+```
+
+---
+
+## 17. Public test 推理泄露检查
+
+### 17.1 目标
+
+确认 public 测试集没有参与训练、调参、模型选择、AdaBN 更新、DANN target training 或指标计算。
+
+### 17.2 public 只能用于
+
+```text
+最终无标签推理
+```
+
+### 17.3 public 不能用于
+
+```text
+训练
+调参
+验证
+early stopping
+选择 checkpoint
+选择模型结构
+选择融合策略
+计算 BA / Macro-F1 / ROC-AUC
+AdaBN 更新后再混入普通排行榜
+DANN target 后再混入普通排行榜
+```
+
+### 17.4 高风险情况
+
+如果发现 public 预测结果影响模型选择，标为：
+
+```text
+critical
+```
+
+---
+
+## 18. Label 泄露检查
+
+### 18.1 目标
+
+确认输入特征、文件名、路径、metadata 中没有把标签信息泄露给模型。
+
+### 18.2 搜索关键词
+
+```text
+depressed
+depression
+control
+healthy
+patient
+label
+diagnosis
+class
+target
+y
+emotion
+positive
+negative
+neutral
+```
+
+### 18.3 高风险示例
+
+```text
+文件夹名包含 depressed / control，并且路径字符串被作为输入特征
+```
+
+或：
+
+```text
+sample_id 包含 label
+```
+
+或：
+
+```text
+metadata 中 diagnosis 被拼进 features
+```
+
+或：
+
+```python
+features.append(metadata)
+```
+
+但 metadata 中包含 label / diagnosis。
+
+### 18.4 注意
+
+从路径中解析标签用于构造 `y` 是正常的；
+风险在于标签或含标签路径被作为模型输入特征。
+
+---
+
+## 19. Fold 生成一致性检查
+
+### 19.1 目标
+
+检查所有 5-fold 实验是否使用相同 fold split。若不同，排行榜比较不再是严格配对比较。
+
+### 19.2 检查内容
+
+对每个实验、每个 fold 记录：
+
+1. train 样本数；
+2. val 样本数；
+3. test 样本数；
+4. train 类别分布；
+5. val 类别分布；
+6. subject 列表；
+7. trial 列表；
+8. random seed；
+9. split hash。
+
+### 19.3 split hash 生成建议
+
+如果能拿到 train/val/test 样本 ID，按排序后的样本 ID 生成 hash，例如：
+
+```text
+split_hash = hash(sorted(train_ids) + sorted(val_ids) + sorted(test_ids))
+```
+
+### 19.4 报告中必须说明
+
+如果排行榜中的实验使用不同 split，需要写：
+
+```text
+这些实验不是完全配对比较，排名只能作为参考。
+```
+
+### 19.5 输出字段
+
+```csv
+experiment,project,fold,n_train,n_val,n_test,class_dist_train,class_dist_val,split_hash,risk_level,reason
+```
+
+---
+
+## 20. 指标计算泄露 / 指标错误检查
+
+### 20.1 目标
+
+确认指标计算方式正确，避免因为计算错误导致结果虚高。
+
+### 20.2 检查内容
+
+1. balanced_accuracy 是否按 sklearn 定义计算；
+2. macro_f1 是否为宏平均；
+3. ROC-AUC 是否使用概率而不是 hard label；
+4. 二分类 ROC-AUC 是否使用 positive class probability；
+5. 多分类 ROC-AUC 是否指定 ovo/ovr；
+6. public `y_true=-1` 是否被排除；
+7. NaN 指标是否被错误填成 0 或 1；
+8. 单折 `std=0` 是否被误认为稳定；
+9. fold mean 是否简单平均；
+10. 是否按样本数加权平均；
+11. classification_report 是否与 summary_metrics 一致。
+
+### 20.3 高风险情况
+
+```text
+y_true = -1 被纳入 BA / Macro-F1 / ROC-AUC 计算
+```
+
+标为：
+
+```text
+critical
+```
+
+---
+
+## 21. 风险等级定义
+
+给每个实验一个最终字段：
+
+```text
+data_leakage_risk_level
+```
+
+可取值：
+
+| 风险等级       | 含义                                  |
+| ---------- | ----------------------------------- |
+| `low`      | 未发现明显泄露，划分和评估基本可信                   |
+| `medium`   | 有模型选择偏差或信息不完整，但未发现直接泄露              |
+| `high`     | 发现 train / val / test 之间存在明显信息泄露    |
+| `critical` | test / public 数据直接参与训练、调参、模型选择或指标计算 |
+| `unknown`  | 证据不足，无法判断                           |
+
+---
+
+## 22. 最终排行榜规则
+
+### 22.1 生成 raw_leaderboard.csv
+
+`raw_leaderboard.csv` 包含所有能计算指标的实验，但要标注风险，不因风险直接删除。
+
+字段至少包括：
+
+```csv
+rank,experiment,project,category,metric_scope,ba_mean,ba_std,macro_f1_mean,macro_f1_std,roc_auc_mean,roc_auc_std,folds,risk_level,risk_summary
+```
+
+### 22.2 生成 trusted_leaderboard.csv
+
+`trusted_leaderboard.csv` 只包含满足以下条件的实验：
+
+1. 是 5-fold CV；
+2. 非 public inference；
+3. 非 single-fold；
+4. 指标口径一致，优先 `trial10s / all:all`；
+5. `data_leakage_risk_level` 为 `low` 或 `medium`；
+6. fold 划分清晰；
+7. 未发现 subject overlap；
+8. 未发现 trial/window overlap；
+9. 未发现 test/public 参与训练或调参；
+10. 未发现 public y_true=-1 参与指标计算；
+11. AdaBN / DANN 若为 transductive，必须单独标注，不能和普通 inductive 实验直接混排。
+
+### 22.3 排名优先级
+
+主排序：
+
+```text
+balanced_accuracy mean descending
+```
+
+次排序：
+
+```text
+macro_f1 mean descending
+```
+
+再次排序：
+
+```text
+std smaller first
+```
+
+报告中同时说明 BA、Macro-F1、ROC-AUC。
+
+---
+
+## 23. 输出文件
+
+所有输出放到：
+
+```text
+audit_outputs/
+```
+
+请生成以下文件：
+
+### 23.1 主报告
+
+```text
+audit_outputs/leakage_audit_report.md
+```
+
+内容包括：
+
+1. 审计目标；
+2. 扫描范围；
+3. 总实验数；
+4. 实验分类统计；
+5. 当前 raw best；
+6. 当前 trusted best；
+7. `tune_b_plateau_wide` 专项结论；
+8. `exp3_vote_5fold` 专项结论；
+9. AdaBN/DANN 专项结论；
+10. 主要泄露风险总结；
+11. 是否建议使用当前排行榜；
+12. 最终可信排行榜摘要；
+13. 需要人工复核的实验列表；
+14. 下一步建议。
+
+---
+
+### 23.2 原始排行榜
+
+```text
+audit_outputs/raw_leaderboard.csv
+```
+
+字段：
+
+```csv
+rank,experiment,project,category,metric_scope,ba_mean,ba_std,macro_f1_mean,macro_f1_std,roc_auc_mean,roc_auc_std,folds,risk_level,risk_summary
+```
+
+---
+
+### 23.3 可信排行榜
+
+```text
+audit_outputs/trusted_leaderboard.csv
+```
+
+字段：
+
+```csv
+rank,experiment,project,metric_scope,ba_mean,ba_std,macro_f1_mean,macro_f1_std,roc_auc_mean,roc_auc_std,folds,risk_level,notes
+```
+
+---
+
+### 23.4 被排除或可疑实验
+
+```text
+audit_outputs/excluded_or_suspicious_runs.csv
+```
+
+字段：
+
+```csv
+experiment,project,category,reason,risk_level,evidence_path,recommendation
+```
+
+---
+
+### 23.5 split 完整性报告
+
+```text
+audit_outputs/split_integrity_report.csv
+```
+
+字段：
+
+```csv
+experiment,project,fold,n_train,n_val,n_test,subject_overlap_count,trial_overlap_count,window_overlap_count,class_dist_train,class_dist_val,split_hash,risk_level,reason,evidence_path
+```
+
+---
+
+### 23.6 归一化 / 特征提取泄露报告
+
+```text
+audit_outputs/normalization_leakage_report.csv
+```
+
+字段：
+
+```csv
+experiment,project,check_type,method,scope,risk_level,evidence_path,evidence_snippet,recommendation
+```
+
+---
+
+### 23.7 AdaBN / DANN 专项报告
+
+```text
+audit_outputs/adabn_dann_leakage_report.csv
+```
+
+字段：
+
+```csv
+experiment,project,method,loader_used,adaptation_setting,risk_level,evidence_path,evidence_snippet,recommendation
+```
+
+---
+
+### 23.8 调参偏差报告
+
+```text
+audit_outputs/tuning_bias_report.csv
+```
+
+字段：
+
+```csv
+experiment,project,tuning_type,uses_same_cv_for_selection,uses_test_or_public,risk_level,evidence_path,reason,recommendation
+```
+
+---
+
+### 23.9 重复样本报告
+
+```text
+audit_outputs/duplicate_sample_report.csv
+```
+
+字段：
+
+```csv
+experiment,project,fold,duplicate_type,count,risk_level,example_ids,evidence_path
+```
+
+---
+
+### 23.10 指标计算检查报告
+
+```text
+audit_outputs/metric_integrity_report.csv
+```
+
+字段：
+
+```csv
+experiment,project,metric_scope,has_y_true_minus_one,public_excluded,uses_prob_for_auc,ba_check,macro_f1_check,roc_auc_check,risk_level,reason
+```
+
+---
+
+## 24. 终端最终摘要
+
+最后在终端打印简短摘要，格式如下：
+
+```text
+===== EEG Experiment Audit Summary =====
+
+Total experiments scanned:
+Valid metric experiments:
+5-fold CV experiments:
+Public inference runs:
+Single-fold runs:
+Invalid/incomplete runs:
+Low-risk experiments:
+Medium-risk experiments:
+High-risk experiments:
+Critical-risk experiments:
+Unknown-risk experiments:
+
+Raw best experiment:
+Raw best BA:
+Raw best Macro-F1:
+Raw best risk level:
+
+Trusted best experiment:
+Trusted best BA:
+Trusted best Macro-F1:
+Trusted best risk level:
+
+tune_b_plateau_wide found:
+tune_b_plateau_wide included in trusted leaderboard:
+Reason:
+
+exp3_vote_5fold included in trusted leaderboard:
+Reason:
+
+Main leakage risks found:
+Recommended final leaderboard file:
+Report file:
+=======================================
+```
+
+---
+
+## 25. 最终判断标准
+
+审计完成后，请在 `leakage_audit_report.md` 中明确给出以下结论之一：
+
+### 情况 A：排行榜基本可信
+
+条件：
+
+* 最优实验是 5-fold CV；
+* 未发现 subject/trial/window overlap；
+* 未发现全数据归一化；
+* 未发现 public/test 参与训练或调参；
+* AdaBN/DANN 设置清晰；
+* 指标口径一致。
+
+结论格式：
+
+```text
+当前 trusted_leaderboard 可以作为阶段性模型选择依据。但如果没有 nested CV 或独立测试集，它仍不是严格无
