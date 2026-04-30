@@ -1,0 +1,534 @@
+
+````markdown
+# 任务：DEP fold0 失效审计，但禁止基于单 fold 过拟合修复
+
+## 背景
+
+当前 EEG 情绪识别主线：
+
+- 主线：Conformer + SRFNet rank ensemble
+- 解码：subject-level Top-4
+- 当前 baseline：BA = 0.7958
+- 分组信息：
+  - DEP / depressed：20 subjects
+  - HC / normal：40 subjects
+  - 每 fold：4 DEP + 8 HC
+
+已有 group-aware 分析结果：
+
+| Group | BA |
+|---|---:|
+| DEP | 0.7375 |
+| HC | 0.8250 |
+
+发现 DEP 组明显低于 HC 组，差距约 0.0875。
+
+Group-specific ensemble weight sweep 已经完成：
+
+- 最优：w_dep=0.525, w_norm=0.4
+- Overall BA = 0.7958
+- 相对 baseline = +0.0000
+
+因此 group-specific score ensemble 没有突破当前主线，应判定为：
+
+```text
+DIAGNOSTIC_ONLY
+````
+
+不要把 group ensemble 标记为新主线候选。
+
+---
+
+# 核心目标
+
+本任务只做诊断，不做提交策略修改。
+
+目标是解释：
+
+```text
+为什么 DEP fold0 表现明显差？
+```
+
+但禁止：
+
+```text
+根据 fold0 / subject / trial_index 写专属修复规则
+```
+
+本任务最终只输出诊断报告和候选后续方向。
+
+---
+
+# 绝对禁止事项
+
+以下行为禁止：
+
+1. 不允许改动主线训练代码；
+2. 不允许改动当前 best ensemble 提交流程；
+3. 不允许用 fold_id 写特判；
+4. 不允许为 DEP fold0 单独调权重；
+5. 不允许为某个 subject 单独调分；
+6. 不允许根据 trial_index 手写规则；
+7. 不允许使用 public feedback / private test label；
+8. 不允许把任何只在 fold0 上变好的方法标记为主线候选。
+
+如果发现某种修复只提升 DEP fold0，但整体五折不提升，必须标记为：
+
+```text
+OVERFIT_RISK / DIAGNOSTIC_ONLY
+```
+
+---
+
+# Phase A：修正 group analysis final decision
+
+## 目标
+
+检查并修正已有 group analysis 报告中的最终决策。
+
+如果报告里写：
+
+```text
+GROUP_ENSEMBLE_CANDIDATE
+```
+
+但实际：
+
+```text
+Overall BA = 0.7958
+vs Baseline = +0.0000
+```
+
+则必须改为：
+
+```text
+DIAGNOSTIC_ONLY
+```
+
+## 输出
+
+```text
+outputs/group_analysis/group_analysis_final_report_fixed.md
+```
+
+报告中必须写明：
+
+```text
+Group-specific ensemble ties baseline but does not exceed it.
+Therefore it is diagnostic-only, not a new candidate.
+```
+
+---
+
+# Phase B：DEP fold0 subject-level error audit
+
+## 目标
+
+定位 DEP fold0 是：
+
+1. 某一个 subject 崩；
+2. 少数 subject 崩；
+3. 4 个 DEP subject 都难；
+4. Top-4 排序错；
+5. score 本身没有分离度。
+
+## 输入
+
+需要读取：
+
+* 当前 best ensemble 的 original trial score 文件；
+* 当前 best ensemble 的 top4 prediction 文件；
+* subject group audit 文件；
+* fold split manifest；
+* y_true；
+* subject_id；
+* fold；
+* prob / score；
+* y_pred_top4。
+
+## 输出文件
+
+```text
+outputs/group_analysis/dep_fold0_subject_error_table.csv
+outputs/group_analysis/dep_fold0_trial_scores.csv
+```
+
+## `dep_fold0_subject_error_table.csv` 字段
+
+| 字段             | 说明                                                      |
+| -------------- | ------------------------------------------------------- |
+| subject_id     | 被试 ID                                                   |
+| group          | 应为 DEP                                                  |
+| fold           | 应为 0                                                    |
+| n_trials       | trial 数                                                 |
+| n_pos          | 正类数量                                                    |
+| n_neg          | 负类数量                                                    |
+| top4_acc       | subject 内 top4 accuracy                                 |
+| subject_ba     | subject 内 BA                                            |
+| tp             | true positive                                           |
+| fp             | false positive                                          |
+| tn             | true negative                                           |
+| fn             | false negative                                          |
+| pos_score_mean | 正类平均分                                                   |
+| neg_score_mean | 负类平均分                                                   |
+| score_margin   | pos_score_mean - neg_score_mean                         |
+| rank_gap_4_5   | 第 4 名和第 5 名 score 差距                                    |
+| failure_type   | ranking_error / low_margin / inverted_score / uncertain |
+
+## 判断逻辑
+
+如果：
+
+```text
+score_margin < 0
+```
+
+标记：
+
+```text
+inverted_score
+```
+
+如果：
+
+```text
+score_margin > 0 但 top4 仍错很多
+```
+
+标记：
+
+```text
+ranking_error
+```
+
+如果：
+
+```text
+rank_gap_4_5 很小
+```
+
+标记：
+
+```text
+low_margin / uncertain
+```
+
+---
+
+# Phase C：Conformer vs SRFNet 分模型诊断
+
+## 目标
+
+判断 DEP fold0 是：
+
+1. Conformer 崩；
+2. SRFNet 崩；
+3. 两者都崩；
+4. 两者互补但 ensemble 没利用好。
+
+## 输入
+
+需要读取每个模型的单独 score：
+
+* Conformer score；
+* SRFNet score；
+* ensemble score；
+* y_true；
+* subject_id；
+* group；
+* fold。
+
+如果当前文件中没有分模型 score，则搜索项目 outputs 中已有的模型预测文件，不要重训。
+
+## 输出
+
+```text
+outputs/group_analysis/dep_fold0_model_compare.csv
+```
+
+## 字段
+
+| 字段                 | 说明                            |
+| ------------------ | ----------------------------- |
+| subject_id         | 被试 ID                         |
+| conformer_top4_acc | Conformer subject 内准确率        |
+| srfnet_top4_acc    | SRFNet subject 内准确率           |
+| ensemble_top4_acc  | Ensemble subject 内准确率         |
+| conformer_ba       | Conformer BA                  |
+| srfnet_ba          | SRFNet BA                     |
+| ensemble_ba        | Ensemble BA                   |
+| best_single_model  | conformer / srfnet / ensemble |
+| complementarity    | 是否互补                          |
+| note               | 简短说明                          |
+
+## 额外输出
+
+整体统计：
+
+```text
+outputs/group_analysis/dep_fold0_model_compare_summary.csv
+```
+
+包含：
+
+| 模型 | DEP fold0 BA | DEP all-fold BA | HC all-fold BA | Overall BA |
+| -- | -----------: | --------------: | -------------: | ---------: |
+
+---
+
+# Phase D：trial index / stimulus position 错误审计
+
+## 目标
+
+检查错误是否集中在某些 trial index。
+
+注意：这里只能做诊断，不能直接基于 trial_index 写规则。
+
+## 输出
+
+```text
+outputs/group_analysis/dep_fold0_trial_position_error.csv
+```
+
+## 字段
+
+| 字段                      | 说明            |
+| ----------------------- | ------------- |
+| trial_index             | trial 顺序      |
+| n_samples               | 样本数           |
+| true_positive_rate      | 真实正类比例        |
+| predicted_positive_rate | 被 top4 选为正类比例 |
+| error_rate              | 错误率           |
+| mean_score              | 平均分           |
+| group                   | DEP           |
+| fold                    | 0             |
+
+## 报告要求
+
+如果发现某些 trial_index 错误特别集中，只能写：
+
+```text
+可能存在 stimulus/trial-position 相关难点，需要进一步验证。
+```
+
+不能写：
+
+```text
+对某些 trial_index 强制调分。
+```
+
+---
+
+# Phase E：score margin / top4 边界审计
+
+## 目标
+
+判断 DEP fold0 的错误是不是低置信度错误。
+
+重点看：
+
+```text
+第 4 名和第 5 名 score 是否很接近
+```
+
+如果第 4、5 名差距很小，说明 top4 边界不稳定，模型只是轻微排序错。
+
+如果第 4、5 名差距很大但选错，说明模型强置信错误。
+
+## 输出
+
+```text
+outputs/group_analysis/dep_fold0_margin_audit.csv
+```
+
+## 字段
+
+| 字段              | 说明                                              |
+| --------------- | ----------------------------------------------- |
+| subject_id      | 被试 ID                                           |
+| top1_score      | 第 1 名 score                                     |
+| top4_score      | 第 4 名 score                                     |
+| rank5_score     | 第 5 名 score                                     |
+| rank_gap_4_5    | top4_score - rank5_score                        |
+| pos_score_mean  | 正类平均分                                           |
+| neg_score_mean  | 负类平均分                                           |
+| score_margin    | pos - neg                                       |
+| error_count     | 错误数                                             |
+| confidence_type | low_confidence / high_confidence_wrong / normal |
+
+---
+
+# Phase F：五折 DEP/HC 难度对比
+
+## 目标
+
+判断 DEP fold0 是否是孤立异常，还是 DEP 组普遍难。
+
+## 输出
+
+```text
+outputs/group_analysis/group_fold_difficulty_matrix.csv
+```
+
+## 字段
+
+| fold | dep_ba | hc_ba | dep_hc_gap | dep_n_subjects | hc_n_subjects |
+| ---- | -----: | ----: | ---------: | -------------: | ------------: |
+
+## 判断
+
+如果只有 fold0 DEP 异常低：
+
+```text
+DEP fold0 may be fold-specific hard split.
+```
+
+如果 DEP 所有 fold 都低：
+
+```text
+DEP group is globally harder.
+```
+
+如果 DEP 某些 fold 高、某些 fold 低：
+
+```text
+DEP difficulty is subject-dependent rather than purely group-dependent.
+```
+
+---
+
+# Phase G：可选候选方向，但不执行大训练
+
+根据诊断结果，提出后续候选方向。
+
+只能提出，不要自动大跑。
+
+## 情况 1：Conformer 和 SRFNet 在 DEP 上互补
+
+可以建议：
+
+```text
+DEP-aware model selection / ensemble
+```
+
+但必须五折统一验证，不能只针对 fold0。
+
+## 情况 2：两个模型在 DEP fold0 都错
+
+说明不是 ensemble weight 问题，建议：
+
+```text
+group-conditioned model
+FiLM
+group-balanced sampler
+group-aware loss
+```
+
+但只能作为下一阶段 smoke test。
+
+## 情况 3：错误集中在 trial_index
+
+只写入可解释性结论，不允许写规则。
+
+## 情况 4：score margin 很小
+
+建议：
+
+```text
+rank loss / pairwise ranking / subject-level margin loss
+```
+
+而不是手动调 top4。
+
+---
+
+# 最终报告
+
+生成：
+
+```text
+outputs/group_analysis/dep_fold0_failure_audit_report.md
+```
+
+报告必须包含：
+
+1. 当前 baseline；
+2. DEP / HC 总体差异；
+3. DEP fold0 具体失败 subject；
+4. 每个失败 subject 的错误类型；
+5. Conformer vs SRFNet 对比；
+6. trial_index 错误分布；
+7. score margin 和 top4 边界分析；
+8. 是否存在过拟合风险；
+9. 是否建议进入 Phase G5；
+10. 最终决策。
+
+## 最终决策只能是以下之一
+
+### 1. `DIAGNOSTIC_ONLY`
+
+条件：
+
+```text
+只发现 fold0 局部问题，没有跨 fold 可泛化方案。
+```
+
+### 2. `PREPARE_GROUP_CONDITIONED_SMOKE`
+
+条件：
+
+```text
+DEP 整体明显更难，且简单 group-specific ensemble 无法修复。
+```
+
+### 3. `PREPARE_RANK_MARGIN_SMOKE`
+
+条件：
+
+```text
+大量错误来自 top4 边界很小，说明排序 margin 不足。
+```
+
+### 4. `NO_ACTION_KEEP_MAINLINE`
+
+条件：
+
+```text
+问题主要是单 fold / 单 subject 噪声，继续修复过拟合风险太高。
+```
+
+---
+
+# 验收标准
+
+任务完成后必须生成以下文件：
+
+```text
+outputs/group_analysis/group_analysis_final_report_fixed.md
+outputs/group_analysis/dep_fold0_subject_error_table.csv
+outputs/group_analysis/dep_fold0_trial_scores.csv
+outputs/group_analysis/dep_fold0_model_compare.csv
+outputs/group_analysis/dep_fold0_model_compare_summary.csv
+outputs/group_analysis/dep_fold0_trial_position_error.csv
+outputs/group_analysis/dep_fold0_margin_audit.csv
+outputs/group_analysis/group_fold_difficulty_matrix.csv
+outputs/group_analysis/dep_fold0_failure_audit_report.md
+```
+
+并在终端打印最终摘要：
+
+```text
+===== DEP FOLD0 FAILURE AUDIT SUMMARY =====
+Decision: ...
+DEP overall BA: ...
+HC overall BA: ...
+DEP fold0 BA: ...
+Main failure type: ...
+Conformer vs SRFNet: ...
+Overfit risk: ...
+Recommended next phase: ...
+==========================================
+```
+
+```
+```
